@@ -1,0 +1,490 @@
+#!/bin/bash
+# zstrappa - Install Zerene OS to a target device
+
+set -e
+
+usage() {
+    cat <<EOF
+Usage: zstrappa [options] <root-device> [boot-device]
+
+Options:
+  --uefi        Force UEFI bootloader installation
+  --bios        Force BIOS/legacy bootloader installation
+
+Install Zerene OS from the live ISO to a target block device.
+
+Arguments:
+  root-device   Target root partition (e.g. /dev/sda2, /dev/nvme0n1p2)
+  boot-device   Optional separate boot partition (e.g. /dev/sda1)
+
+Examples:
+  zstrappa /dev/sda2 /dev/sda1
+  zstrappa --uefi /dev/sda2 /dev/sda1
+
+Note: For UEFI, the boot partition is auto-formatted as FAT32.
+EOF
+    exit 1
+}
+
+UEFI_OVERRIDE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --uefi) UEFI_OVERRIDE=1; shift ;;
+        --bios) UEFI_OVERRIDE=0; shift ;;
+        -h|--help) usage ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+[ $# -ge 1 ] || usage
+
+ROOT_DEV="$1"
+BOOT_DEV="$2"
+MP="/mnt/target"
+
+check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Error: zstrappa must be run with root privileges" >&2
+        exit 1
+    fi
+}
+
+validate_device() {
+    local dev="$1" label="$2"
+    if [ ! -b "$dev" ]; then
+        echo "Error: $label $dev is not a block device" >&2
+        exit 1
+    fi
+    if mount | grep -q "^$dev "; then
+        echo "Error: $label $dev is already mounted" >&2
+        exit 1
+    fi
+}
+
+detect_uefi() {
+    if [ -n "$UEFI_OVERRIDE" ]; then
+        [ "$UEFI_OVERRIDE" = "1" ]
+        return
+    fi
+    [ -d /sys/firmware/efi ]
+}
+
+setup_boot_partition_uefi() {
+    local part_num disk fstype
+    part_num=$(echo "$BOOT_DEV" | grep -o '[0-9]*$')
+    disk=$(echo "$BOOT_DEV" | sed 's/[0-9]*$//')
+    disk=$(echo "$disk" | sed 's/p$//')
+
+    fstype=$(blkid -s TYPE -o value "$BOOT_DEV" 2>/dev/null || echo "")
+
+    if [ "$fstype" = "vfat" ]; then
+        echo "Boot partition $BOOT_DEV is already FAT32."
+        return
+    fi
+
+    echo "Formatting $BOOT_DEV as FAT32 (EFI System Partition)..."
+    mkfs.vfat -v -F 32 "$BOOT_DEV" || {
+        echo "Error: Failed to format $BOOT_DEV as FAT32" >&2
+        exit 1
+    }
+
+    if sfdisk -d "$disk" 2>/dev/null | grep -q 'label: gpt'; then
+        echo "Setting partition type to EFI System (C12A7328-F81F-11D2-BA4B-00A0C93EC93B)..."
+        sfdisk --part-type "$disk" "$part_num" "C12A7328-F81F-11D2-BA4B-00A0C93EC93B" || {
+            echo "Warning: Failed to set GPT partition type" >&2
+        }
+    fi
+}
+
+mount_target() {
+    if detect_uefi; then
+        if [ -z "$BOOT_DEV" ]; then
+            echo "Error: --uefi requires a boot partition (ESP)" >&2
+            exit 1
+        fi
+        setup_boot_partition_uefi
+    fi
+    mount -t tmpfs tmpfs /mnt
+    mkdir -p "$MP"
+    echo "Formatting $ROOT_DEV as btrfs..."
+    mkfs.btrfs -f -L zerene "$ROOT_DEV" || {
+        echo "Error: Failed to format $ROOT_DEV" >&2
+        exit 1
+    }
+
+    # Create @ (live root) and @snapshots layout on the top-level volume
+    local tl
+    tl=$(mktemp -d /mnt/zstrappa-tl.XXXXXX)
+    mount "$ROOT_DEV" "$tl" || {
+        echo "Error: Failed to mount $ROOT_DEV for subvolume setup" >&2
+        exit 1
+    }
+    echo "Creating btrfs subvolumes @ and @snapshots..."
+    btrfs subvolume create "$tl/@" || {
+        echo "Error: Failed to create @ subvolume" >&2
+        umount "$tl"; rmdir "$tl"
+        exit 1
+    }
+    btrfs subvolume create "$tl/@snapshots" || {
+        echo "Error: Failed to create @snapshots subvolume" >&2
+        umount "$tl"; rmdir "$tl"
+        exit 1
+    }
+    umount "$tl"
+    rmdir "$tl"
+
+    mount -o subvol=@ "$ROOT_DEV" "$MP" || {
+        echo "Error: Failed to mount $ROOT_DEV subvol=@ on $MP" >&2
+        exit 1
+    }
+    mkdir -p "$MP/.snapshots"
+    mount -o subvol=@snapshots "$ROOT_DEV" "$MP/.snapshots" || {
+        echo "Error: Failed to mount @snapshots on $MP/.snapshots" >&2
+        umount "$MP"
+        exit 1
+    }
+    if [ -n "$BOOT_DEV" ]; then
+        mkdir -p "$MP/boot"
+        mount "$BOOT_DEV" "$MP/boot" || {
+            echo "Error: Failed to mount $BOOT_DEV on $MP/boot" >&2
+            umount "$MP/.snapshots" 2>/dev/null || true
+            umount "$MP"
+            exit 1
+        }
+    fi
+}
+
+
+
+copy_rootfs() {
+    echo "Copying root filesystem (this may take a while)..."
+    rsync -aHAX -P / "$MP" \
+        --no-owner --no-group \
+        --exclude=/dev \
+        --exclude=/proc \
+        --exclude=/sys \
+        --exclude=/run \
+        --exclude=/tmp \
+        --exclude=/mnt \
+        --exclude=/lost+found \
+        --exclude=/.snapshots \
+        --exclude=/boot/initramfs-fullroot.img
+}
+
+get_uuid() {
+    blkid "$1" 2>/dev/null | sed -n 's/.*UUID="\([^"]*\)".*/\1/p'
+}
+
+get_partuuid() {
+    blkid "$1" 2>/dev/null | sed -n 's/.*PARTUUID="\([^"]*\)".*/\1/p'
+}
+
+update_boot_config() {
+    local root_uuid part_uuid root_spec kernel initrd extras
+    root_uuid=$(get_uuid "$ROOT_DEV")
+    part_uuid=$(get_partuuid "$ROOT_DEV")
+
+    if [ -n "$root_uuid" ]; then
+        root_spec="UUID=$root_uuid"
+    elif [ -n "$part_uuid" ]; then
+        root_spec="PARTUUID=$part_uuid"
+    else
+        root_spec="$ROOT_DEV"
+    fi
+
+    # Prefer kernels already copied onto the target boot partition
+    kernel=$(ls "$MP/boot"/vmlinuz-* 2>/dev/null | head -1 | xargs -r basename)
+    [ -n "$kernel" ] || kernel="vmlinuz-6.16.1-defzrn"
+    if [ -f "$MP/boot/initramfs-installed.img" ]; then
+        initrd="initramfs-installed.img"
+    else
+        initrd=$(ls "$MP/boot"/initramfs-*.img 2>/dev/null | head -1 | xargs -r basename)
+        [ -n "$initrd" ] || initrd="initramfs-installed.img"
+    fi
+
+    extras=""
+    if [ -f "$MP/etc/zerene/definition.lua" ]; then
+        extras=$(sed -n 's/.*kernel_cmdline[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+            "$MP/etc/zerene/definition.lua" | head -1)
+    fi
+
+    local limine_conf="$MP/boot/limine.conf"
+    echo "Writing boot configuration (root=$root_spec rootflags=subvol=@)..."
+    cat > "$limine_conf" <<EOF
+# Limine configuration for Zerene OS — managed by genzee
+# Do not hand-edit generation entries; run: genzee rewrite-limine
+
+timeout: 15
+serial: yes
+
+/Zerene OS
+    protocol: linux
+    kernel_path: boot():/${kernel}
+    module_path: boot():/${initrd}
+    cmdline: root=${root_spec} rootflags=subvol=@ rw ${extras}
+EOF
+}
+
+
+
+generate_fstab() {
+    local root_uuid boot_uuid root_spec
+    root_uuid=$(get_uuid "$ROOT_DEV")
+
+    if [ -n "$root_uuid" ]; then
+        root_spec="UUID=$root_uuid"
+    else
+        root_spec="$ROOT_DEV"
+    fi
+
+    echo "Generating /etc/fstab..."
+    cat > "$MP/etc/fstab" << FSTAB
+# /etc/fstab - Generated by zstrappa
+proc            /proc           proc            nosuid,noexec,nodev    0 0
+sysfs           /sys            sysfs           nosuid,noexec,nodev    0 0
+devtmpfs        /dev            devtmpfs        mode=0755,nosuid       0 0
+devpts          /dev/pts        devpts          gid=5,mode=620         0 0
+tmpfs           /run            tmpfs           nosuid,nodev,mode=0755 0 0
+tmpfs           /tmp            tmpfs           nosuid,nodev,mode=1777 0 0
+tmpfs           /var/log        tmpfs           nosuid,nodev,mode=0755 0 0
+tmpfs           /var/cache      tmpfs           nosuid,nodev,mode=0755 0 0
+
+# btrfs generations layout
+${root_spec} / btrfs subvol=@,defaults,noatime 0 1
+${root_spec} /.snapshots btrfs subvol=@snapshots,defaults,noatime 0 0
+FSTAB
+
+    if [ -n "$BOOT_DEV" ]; then
+        boot_uuid=$(get_uuid "$BOOT_DEV")
+        if [ -n "$boot_uuid" ]; then
+            echo "UUID=$boot_uuid /boot vfat defaults 0 0" >> "$MP/etc/fstab"
+        else
+            echo "$BOOT_DEV /boot auto defaults 0 0" >> "$MP/etc/fstab"
+        fi
+    fi
+}
+
+
+
+create_dirs() {
+    for d in proc sys dev run tmp; do
+        mkdir -p "$MP/$d"
+    done
+}
+
+install_bootloader_uefi() {
+    local esp_mnt="$MP/boot"
+    local esp_mounted=false
+
+    # Mount ESP if not already mounted
+    if ! mountpoint -q "$esp_mnt" 2>/dev/null && [ -n "$BOOT_DEV" ]; then
+        mount "$BOOT_DEV" "$esp_mnt" 2>/dev/null && esp_mounted=true
+    elif mountpoint -q "$esp_mnt" 2>/dev/null; then
+        esp_mounted=true
+    fi
+
+    if [ "$esp_mounted" = false ]; then
+        echo "Warning: ESP not accessible, skipping bootloader install" >&2
+        return
+    fi
+
+    echo "Installing UEFI bootloader..."
+    mkdir -p "$esp_mnt/EFI/BOOT"
+    cp -v /EFI/BOOT/BOOTX64.EFI "$esp_mnt/EFI/BOOT/BOOTX64.EFI" || {
+        echo "Error: Failed to copy BOOTX64.EFI" >&2
+        return
+    }
+
+    # Create firmware boot entry so the system appears in UEFI boot menu
+    local disk part_num
+    if [ -n "$BOOT_DEV" ]; then
+        part_num=$(echo "$BOOT_DEV" | grep -o '[0-9]*$')
+        disk=$(echo "$BOOT_DEV" | sed 's/[0-9]*$//;s/p$//')
+    fi
+
+    if [ -n "$disk" ] && [ -n "$part_num" ]; then
+        if command -v efibootmgr &>/dev/null; then
+            echo "Creating UEFI boot entry..."
+            efibootmgr -c -d "$disk" -p "$part_num" -L "Zerene OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
+                echo "Warning: Failed to create UEFI boot entry" >&2
+                echo "Some firmware may not boot without a manual entry." >&2
+                echo "You can add one later with:" >&2
+                echo "  efibootmgr -c -d $disk -p $part_num -L 'Zerene OS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
+            }
+        else
+            echo "Warning: efibootmgr not found. UEFI boot entry not created." >&2
+            echo "Boot via fallback EFI/BOOT/BOOTX64.EFI (may not work on all firmware)." >&2
+        fi
+    else
+        echo "Warning: Could not determine ESP disk/partition for boot entry." >&2
+    fi
+
+    echo "UEFI bootloader installed."
+}
+
+install_bootloader() {
+    if detect_uefi; then
+        install_bootloader_uefi
+        return
+    fi
+
+    local disk
+    disk=$(echo "$ROOT_DEV" | sed 's/[0-9]*$//')
+    disk=$(echo "$disk" | sed 's/p$//')
+
+    if [ -b "$disk" ]; then
+        if sfdisk -d "$disk" 2>/dev/null | grep -q 'label: gpt'; then
+            echo "Detected GPT partition table."
+            if sfdisk -d "$disk" 2>/dev/null | grep -q 'type=21686148-6449-6E6F-744E-656564454649'; then
+                echo "Installing Limine bootloader to $disk..."
+                "$MP/usr/bin/limine" bios-install "$disk" || {
+                    echo "Warning: limine bios-install failed" >&2
+                }
+            else
+                echo "Warning: No BIOS boot partition (type ef02) found on GPT disk."
+                echo "Attempting install with --force (embedding in GPT gap)..."
+                "$MP/usr/bin/limine" bios-install --force "$disk" || {
+                    echo "Error: limine bios-install failed." >&2
+                    echo "If your system is UEFI, re-run with --uefi." >&2
+                    echo "Otherwise, create a 1MB BIOS boot partition (type ef02) and re-run." >&2
+                }
+            fi
+        else
+            echo "Installing Limine bootloader to $disk..."
+            "$MP/usr/bin/limine" bios-install "$disk" || {
+                echo "Warning: limine bios-install failed" >&2
+            }
+        fi
+    else
+        echo "Warning: Could not determine parent disk for $ROOT_DEV" >&2
+    fi
+}
+
+cleanup() {
+    echo "Syncing and unmounting..."
+    sync
+    umount "$MP/sys" 2>/dev/null || true
+    umount "$MP/proc" 2>/dev/null || true
+    umount "$MP/dev/pts" 2>/dev/null || true
+    umount "$MP/dev" 2>/dev/null || true
+    if [ -n "$BOOT_DEV" ]; then
+        umount "$MP/boot" 2>/dev/null || true
+    fi
+    umount "$MP/.snapshots" 2>/dev/null || true
+    umount "$MP" 2>/dev/null || true
+}
+
+create_initial_generation() {
+    echo "Creating initial generation (gen-1)..."
+    # Snapshot @ -> @snapshots/gen-1 from the top-level
+    local tl
+    tl=$(mktemp -d /mnt/zstrappa-gen.XXXXXX)
+    if ! mount -t btrfs -o subvol=/ "$ROOT_DEV" "$tl"; then
+        echo "Warning: could not mount top-level for initial generation" >&2
+        rmdir "$tl" 2>/dev/null || true
+        return 0
+    fi
+    if [ -d "$tl/@snapshots/gen-1" ]; then
+        btrfs subvolume delete "$tl/@snapshots/gen-1" 2>/dev/null || true
+    fi
+    if btrfs subvolume snapshot -r "$tl/@" "$tl/@snapshots/gen-1"; then
+        local ts
+        ts=$(date +%s)
+        # meta beside RO snap (cannot write inside RO subvolume)
+        if [ -d "$MP/.snapshots" ]; then
+            cat > "$MP/.snapshots/gen-1.meta.toml" <<EOF
+id = "gen-1"
+timestamp = $ts
+description = "initial install"
+EOF
+            echo "gen-1" > "$MP/.snapshots/.current"
+        fi
+        echo "Initial generation gen-1 created."
+    else
+        echo "Warning: failed to create initial generation" >&2
+    fi
+    umount "$tl" 2>/dev/null || true
+    rmdir "$tl" 2>/dev/null || true
+
+    # Expand limine with Generations submenu
+    if [ -x "$MP/usr/bin/genzee" ]; then
+        # Run genzee rewrite against the installed tree's /boot
+        mount --bind /dev "$MP/dev" 2>/dev/null || true
+        mount --bind /proc "$MP/proc" 2>/dev/null || true
+        mount --bind /sys "$MP/sys" 2>/dev/null || true
+        chroot "$MP" /usr/bin/genzee rewrite-limine 2>/dev/null || {
+            echo "Warning: genzee rewrite-limine failed; writing submenu manually" >&2
+            append_generation_limine_entry
+        }
+        umount "$MP/sys" 2>/dev/null || true
+        umount "$MP/proc" 2>/dev/null || true
+        umount "$MP/dev" 2>/dev/null || true
+    else
+        append_generation_limine_entry
+    fi
+}
+
+append_generation_limine_entry() {
+    local limine_conf="$MP/boot/limine.conf"
+    [ -f "$limine_conf" ] || return 0
+    # Already has Generations?
+    grep -q '^/Generations' "$limine_conf" 2>/dev/null && return 0
+
+    local root_uuid part_uuid root_spec kernel initrd cmdline extras
+    root_uuid=$(get_uuid "$ROOT_DEV")
+    part_uuid=$(get_partuuid "$ROOT_DEV")
+    if [ -n "$root_uuid" ]; then
+        root_spec="UUID=$root_uuid"
+    elif [ -n "$part_uuid" ]; then
+        root_spec="PARTUUID=$part_uuid"
+    else
+        root_spec="$ROOT_DEV"
+    fi
+    kernel=$(ls "$MP/boot"/vmlinuz-* 2>/dev/null | head -1 | xargs -r basename)
+    [ -n "$kernel" ] || kernel="vmlinuz-6.16.1-defzrn"
+    if [ -f "$MP/boot/initramfs-installed.img" ]; then
+        initrd="initramfs-installed.img"
+    else
+        initrd=$(ls "$MP/boot"/initramfs-*.img 2>/dev/null | head -1 | xargs -r basename)
+        [ -n "$initrd" ] || initrd="initramfs-installed.img"
+    fi
+    extras=""
+    cmdline=$(grep -m1 'cmdline:' "$limine_conf" | sed 's/.*cmdline:[[:space:]]*//')
+    for tok in $cmdline; do
+        case "$tok" in
+            root=*|rootflags=*|rw|ro) ;;
+            *) extras="${extras:+$extras }$tok" ;;
+        esac
+    done
+
+    cat >> "$limine_conf" <<EOF
+
+/Generations
+    //Zerene OS (Generation 1)
+        protocol: linux
+        kernel_path: boot():/${kernel}
+        module_path: boot():/${initrd}
+        cmdline: root=${root_spec} rootflags=subvol=@snapshots/gen-1 rw ${extras}
+EOF
+}
+
+check_root
+validate_device "$ROOT_DEV" "root"
+[ -n "$BOOT_DEV" ] && validate_device "$BOOT_DEV" "boot"
+
+trap cleanup EXIT
+
+mount_target
+copy_rootfs
+update_boot_config
+generate_fstab
+create_dirs
+install_bootloader
+create_initial_generation
+
+echo "Zerene OS installed successfully."
+echo "Root is btrfs subvol=@ with generations under @snapshots."
+echo "You can now reboot."
+
+
