@@ -473,10 +473,10 @@ check_root
 validate_device "$ROOT_DEV" "root"
 [ -n "$BOOT_DEV" ] && validate_device "$BOOT_DEV" "boot"
 
-read -rp "Bootstrap Zerene OS? this will wipe the whole drive, this action cannot be undone: " choice
+read -rp "Bootstrap Zerene OS? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
 
 case "$choice" in
-    Y)
+    [Yy])
       echo "Now bootstrapping..."
       sleep 1
       trap cleanup EXIT
@@ -487,7 +487,7 @@ case "$choice" in
       create_dirs
       install_bootloader
       create_initial_generation
-      echo "Zerene OS has been successfully bootstrapped and installed, you can reboot now"
+      echo "Zerene OS has been successfully bootstrapped and installed on your machine, you can reboot now."
       ;;
     *)
       echo "Cancelled."
