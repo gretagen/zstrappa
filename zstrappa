@@ -473,18 +473,26 @@ check_root
 validate_device "$ROOT_DEV" "root"
 [ -n "$BOOT_DEV" ] && validate_device "$BOOT_DEV" "boot"
 
-trap cleanup EXIT
+read -rp "Bootstrap Zerene OS? this will wipe the whole drive, this action cannot be undone: " choice
 
-mount_target
-copy_rootfs
-update_boot_config
-generate_fstab
-create_dirs
-install_bootloader
-create_initial_generation
-
-echo "Zerene OS installed successfully."
-echo "Root is btrfs subvol=@ with generations under @snapshots."
-echo "You can now reboot."
+case "$choice" in
+    Y)
+      echo "Now bootstrapping..."
+      sleep 1
+      trap cleanup EXIT
+      mount_target
+      copy_rootfs
+      update_boot_config
+      generate_fstab
+      create_dirs
+      install_bootloader
+      create_initial_generation
+      echo "Zerene OS has been successfully bootstrapped and installed, you can reboot now"
+      ;;
+    *)
+      echo "Cancelled."
+      exit 0
+      ;;
+esac
 
 
