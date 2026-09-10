@@ -1,5 +1,5 @@
 #!/bin/bash
-# zstrappa - Install Zerene OS to a target device
+# zstrappa - Install Haliade OS to a target device
 
 set -e
 
@@ -11,7 +11,7 @@ Options:
   --uefi        Force UEFI bootloader installation
   --bios        Force BIOS/legacy bootloader installation
 
-Install Heliade OS from the live ISO to a target block device.
+Install Haliade OS from the live ISO to a target block device.
 
 Arguments:
   root-device   Target root partition (e.g. /dev/sda2, /dev/nvme0n1p2)
@@ -108,7 +108,7 @@ mount_target() {
     mount -t tmpfs tmpfs /mnt
     mkdir -p "$MP"
     echo "Formatting $ROOT_DEV as btrfs..."
-    mkfs.btrfs -f -L heliade "$ROOT_DEV" || {
+    mkfs.btrfs -f -L haliade "$ROOT_DEV" || {
         echo "Error: Failed to format $ROOT_DEV" >&2
         exit 1
     }
@@ -204,21 +204,21 @@ update_boot_config() {
     fi
 
     extras=""
-    if [ -f "$MP/etc/heliade/definition.lua" ]; then
+    if [ -f "$MP/etc/haliade/definition.lua" ]; then
         extras=$(sed -n 's/.*kernel_cmdline[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-            "$MP/etc/heliade/definition.lua" | head -1)
+            "$MP/etc/haliade/definition.lua" | head -1)
     fi
 
     local limine_conf="$MP/boot/limine.conf"
     echo "Writing boot configuration (root=$root_spec rootflags=subvol=@)..."
     cat > "$limine_conf" <<EOF
-# Limine configuration for Heliade OS — managed by genzee
+# Limine configuration for Haliade OS — managed by genzee
 # Do not hand-edit generation entries; run: genzee rewrite-limine
 
 timeout: 15
 serial: yes
 
-/Heliade OS
+/Haliade OS
     protocol: linux
     kernel_path: boot():/${kernel}
     module_path: boot():/${initrd}
@@ -306,11 +306,11 @@ install_bootloader_uefi() {
     if [ -n "$disk" ] && [ -n "$part_num" ]; then
         if command -v efibootmgr &>/dev/null; then
             echo "Creating UEFI boot entry..."
-            efibootmgr -c -d "$disk" -p "$part_num" -L "Heliade OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
+            efibootmgr -c -d "$disk" -p "$part_num" -L "Haliade OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
                 echo "Warning: Failed to create UEFI boot entry" >&2
                 echo "Some firmware may not boot without a manual entry." >&2
                 echo "You can add one later with:" >&2
-                echo "  efibootmgr -c -d $disk -p $part_num -L 'Heliade OS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
+                echo "  efibootmgr -c -d $disk -p $part_num -L 'Haliade OS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
             }
         else
             echo "Warning: efibootmgr not found. UEFI boot entry not created." >&2
@@ -461,7 +461,7 @@ append_generation_limine_entry() {
     cat >> "$limine_conf" <<EOF
 
 /Generations
-    //Heliade OS (Generation 1)
+    //Haliade OS (Generation 1)
         protocol: linux
         kernel_path: boot():/${kernel}
         module_path: boot():/${initrd}
@@ -473,7 +473,7 @@ check_root
 validate_device "$ROOT_DEV" "root"
 [ -n "$BOOT_DEV" ] && validate_device "$BOOT_DEV" "boot"
 
-read -rp "Bootstrap Heliade OS? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
+read -rp "Bootstrap Haliade OS? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
 
 case "$choice" in
     [Yy])
@@ -487,7 +487,7 @@ case "$choice" in
       create_dirs
       install_bootloader
       create_initial_generation
-      echo "Heliade OS has been successfully bootstrapped and installed on your machine, you can reboot now."
+      echo "Haliade OS has been successfully bootstrapped and installed on your machine, you can reboot now."
       ;;
     *)
       echo "Cancelled."
