@@ -302,61 +302,31 @@ verify_initramfs_run_mount() {
     return 1
 }
 
-generate_initramfs() {
-    echo "Generating initramfs for installed system..."
+ensure_installed_initramfs() {
+    echo "Reusing shipped initramfs (no regeneration)..."
 
-    # Detect kernel version from the installed rootfs (already rsynced)
-    local kver
-    kver=$(ls "$MP/boot"/vmlinuz-* 2>/dev/null | head -1 | xargs -r basename | sed 's/^vmlinuz-//')
-    if [ -z "$kver" ]; then
-        echo "Error: no kernel found in $MP/boot" >&2
-        return 1
-    fi
-    echo "  kernel: $kver"
-
-    # Create installed.preset
-    mkdir -p "$MP/etc/mkinitcpio.d"
-    cat > "$MP/etc/mkinitcpio.d/installed.preset" <<EOF
-PRESETS=(default)
-default_kver="/boot/vmlinuz-${kver}"
-default_image="/boot/initramfs-installed.img"
-EOF
-
-    # Ensure /run mounts with source "tmpfs" in the init_functions mkinitcpio
-    # packages — both on the build host and in the target rootfs — so a fresh
-    # install is fixed even if this ISO shipped an unpatched file.
-    for f in /usr/lib/initcpio/init_functions /usr/lib64/initcpio/init_functions \
-             "$MP"/usr/lib/initcpio/init_functions "$MP"/usr/lib64/initcpio/init_functions; do
-        fix_initramfs_run_mount "$f"
-    done
-
-    # Match the proven-bootable image: zstd-compressed main archive
-    sed -i 's/^COMPRESSION=.*/COMPRESSION="zstd"/' "$MP/etc/mkinitcpio-installed.conf"
-
-    # Run mkinitcpio on the live system, using installed rootfs for libs/modules
-    # -c: config from installed rootfs
-    # -k: kernel version
-    # -r: root = installed rootfs (finds lib/modules/$kver AND usr/lib/libc.so.6)
-    # -g: output to target
-    mkinitcpio \
-        -c "$MP/etc/mkinitcpio-installed.conf" \
-        -k "$kver" \
-        -r "$MP" \
-        -g "$MP/boot/initramfs-installed.img" 2>&1 || {
-            echo "Error: mkinitcpio failed to create initramfs" >&2
-            return 1
-        }
-
-    if [ ! -f "$MP/boot/initramfs-installed.img" ] || [ ! -s "$MP/boot/initramfs-installed.img" ]; then
-        echo "Error: initramfs not created" >&2
+    # The installed initramfs ships pre-built inside this live rootfs as
+    # boot/initramfs-installed.img and is copied to the target by copy_rootfs.
+    # We do NOT regenerate it here: mkinitcpio against the read-only live
+    # squashfs (host-side init_functions / mkinitcpio-installed.conf) fails,
+    # and regenerating per-install is unnecessary — the shipped image is the
+    # one that was boot-tested.
+    if [ ! -s "$MP/boot/initramfs-installed.img" ]; then
+        echo "Error: boot/initramfs-installed.img not found after rootfs copy" >&2
         return 1
     fi
 
     if ! verify_initramfs_run_mount "$MP/boot/initramfs-installed.img"; then
-        echo "Error: generated initramfs mounts /run with source 'run', not 'tmpfs'; refusing to install" >&2
+        echo "Error: shipped initramfs mounts /run with source 'run', not 'tmpfs'; refusing to install" >&2
         return 1
     fi
     echo "  initramfs: $MP/boot/initramfs-installed.img ($(du -h "$MP/boot/initramfs-installed.img" | cut -f1))"
+
+    # Keep the target's on-disk mkinitcpio init_functions patched so any later
+    # manual regeneration outside zstrappa also produces a correct /run mount.
+    for f in "$MP"/usr/lib/initcpio/init_functions "$MP"/usr/lib64/initcpio/init_functions; do
+        fix_initramfs_run_mount "$f"
+    done
 }
 
 fix_permissions() {
@@ -583,7 +553,7 @@ case "$choice" in
       mount_target
       copy_rootfs
       create_dirs
-      generate_initramfs
+      ensure_installed_initramfs
       fix_permissions
       update_boot_config
       generate_fstab
