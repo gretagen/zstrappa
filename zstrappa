@@ -553,7 +553,6 @@ case "$choice" in
       mount_target
       copy_rootfs
       create_dirs
-      ensure_installed_initramfs
       fix_permissions
       update_boot_config
       generate_fstab
