@@ -211,8 +211,8 @@ update_boot_config() {
     local limine_conf="$MP/boot/limine.conf"
     echo "Writing boot configuration (root=$root_spec rootflags=subvol=@)..."
     cat > "$limine_conf" <<EOF
-# Limine configuration for Haliade OS — managed by genzee
-# Do not hand-edit generation entries; run: genzee rewrite-limine
+# Limine configuration for Haliade OS — managed by chronos
+# Do not hand-edit generation entries; run: chronos rewrite-limine
 
 timeout: 15
 serial: yes
@@ -478,13 +478,13 @@ EOF
     rmdir "$tl" 2>/dev/null || true
 
     # Expand limine with Generations submenu
-    if [ -x "$MP/usr/bin/genzee" ]; then
-        # Run genzee rewrite against the installed tree's /boot
+    if [ -x "$MP/usr/bin/chronos" ]; then
+        # Run chronos rewrite against the installed tree's /boot
         mount --bind /dev "$MP/dev" 2>/dev/null || true
         mount --bind /proc "$MP/proc" 2>/dev/null || true
         mount --bind /sys "$MP/sys" 2>/dev/null || true
-        chroot "$MP" /usr/bin/genzee rewrite-limine 2>/dev/null || {
-            echo "Warning: genzee rewrite-limine failed; writing submenu manually" >&2
+        chroot "$MP" /usr/bin/chronos rewrite-limine 2>/dev/null || {
+            echo "Warning: chronos rewrite-limine failed; writing submenu manually" >&2
             append_generation_limine_entry
         }
         umount "$MP/sys" 2>/dev/null || true
