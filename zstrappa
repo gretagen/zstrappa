@@ -42,6 +42,7 @@ done
 ROOT_DEV="$1"
 BOOT_DEV="$2"
 MP="/mnt/target"
+BOOT_MOUNTED=false
 
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -152,6 +153,7 @@ mount_target() {
             umount "$MP"
             exit 1
         }
+        BOOT_MOUNTED=true
     fi
 }
 
@@ -172,11 +174,11 @@ copy_rootfs() {
 }
 
 get_uuid() {
-    blkid "$1" 2>/dev/null | sed -n 's/.*UUID="\([^"]*\)".*/\1/p'
+    blkid -s UUID -o value "$1" 2>/dev/null
 }
 
 get_partuuid() {
-    blkid "$1" 2>/dev/null | sed -n 's/.*PARTUUID="\([^"]*\)".*/\1/p'
+    blkid -s PARTUUID -o value "$1" 2>/dev/null
 }
 
 update_boot_config() {
@@ -248,7 +250,7 @@ generate_fstab() {
 tmpfs           /run            tmpfs           nosuid,nodev,mode=0755 0 0
 tmpfs           /tmp            tmpfs           nosuid,nodev,mode=1777 0 0
 tmpfs           /var/log        tmpfs           nosuid,nodev,mode=0755 0 0
-tmpfs           /var/cache      tmpfs           nosuid=nodev,mode=0755 0 0
+tmpfs           /var/cache      tmpfs           nosuid,nodev,mode=0755 0 0
 tmpfs           /var/tmp        tmpfs           nosuid,nodev,mode=1777 0 0
 tmpfs           /var/lock       tmpfs           nosuid,nodev,mode=0755 0 0
 
@@ -257,12 +259,12 @@ ${root_spec} / btrfs subvol=@,defaults,noatime 0 1
 ${root_spec} /.snapshots btrfs subvol=@snapshots,defaults,noatime 0 0
 FSTAB
 
-    if [ -n "$BOOT_DEV" ]; then
+    if [ "$BOOT_MOUNTED" = "true" ]; then
         boot_uuid=$(get_uuid "$BOOT_DEV")
         if [ -n "$boot_uuid" ]; then
-            echo "UUID=$boot_uuid /boot vfat defaults 0 0" >> "$MP/etc/fstab"
+            echo "UUID=$boot_uuid /boot vfat defaults,nofail 0 0" >> "$MP/etc/fstab"
         else
-            echo "$BOOT_DEV /boot auto defaults 0 0" >> "$MP/etc/fstab"
+            echo "$BOOT_DEV /boot auto defaults,nofail 0 0" >> "$MP/etc/fstab"
         fi
     fi
 }
@@ -361,7 +363,15 @@ install_bootloader_uefi() {
 
     echo "Installing UEFI bootloader..."
     mkdir -p "$esp_mnt/EFI/BOOT"
-    cp -v /EFI/BOOT/BOOTX64.EFI "$esp_mnt/EFI/BOOT/BOOTX64.EFI" || {
+    local limine_efi=""
+    for cand in "$MP/usr/share/limine/BOOTX64.EFI" /usr/share/limine/BOOTX64.EFI /EFI/BOOT/BOOTX64.EFI; do
+        [ -f "$cand" ] && { limine_efi="$cand"; break; }
+    done
+    if [ -z "$limine_efi" ]; then
+        echo "Error: no BOOTX64.EFI found (tried \$MP/usr/share/limine, /usr/share/limine, /EFI/BOOT)" >&2
+        return
+    fi
+    cp -v "$limine_efi" "$esp_mnt/EFI/BOOT/BOOTX64.EFI" || {
         echo "Error: Failed to copy BOOTX64.EFI" >&2
         return
     }
@@ -539,6 +549,27 @@ append_generation_limine_entry() {
 EOF
 }
 
+verify_boot_files() {
+    local boot_dir="$MP/boot" missing=""
+    [ -d "$boot_dir" ] || { echo "Error: $boot_dir missing" >&2; return 1; }
+    ls "$boot_dir"/vmlinuz-* >/dev/null 2>&1 || missing="$missing vmlinuz"
+    if ! ls "$boot_dir"/initramfs-*.img >/dev/null 2>&1 && \
+       ! ls "$boot_dir"/initrd-* >/dev/null 2>&1; then
+        missing="$missing initramfs"
+    fi
+    [ -f "$boot_dir/limine.conf" ] || missing="$missing limine.conf"
+    if [ -n "$missing" ]; then
+        echo "Error: boot files missing on target:${missing}" >&2
+        ls -la "$boot_dir" >&2 || true
+        return 1
+    fi
+    echo "Verified boot files in $boot_dir:"
+    local f
+    for f in "$boot_dir"/vmlinuz-* "$boot_dir"/initramfs-*.img "$boot_dir"/initrd-* "$boot_dir"/limine.conf; do
+        [ -e "$f" ] && echo "  $(basename "$f")"
+    done
+}
+
 check_root
 validate_device "$ROOT_DEV" "root"
 [ -n "$BOOT_DEV" ] && validate_device "$BOOT_DEV" "boot"
@@ -555,6 +586,7 @@ case "$choice" in
       create_dirs
       fix_permissions
       update_boot_config
+      verify_boot_files
       generate_fstab
       install_bootloader
       create_initial_generation
