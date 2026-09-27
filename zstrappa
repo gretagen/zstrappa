@@ -161,6 +161,12 @@ mount_target() {
 
 copy_rootfs() {
     echo "Copying root filesystem (this may take a while)..."
+    # /intro and /motd are live-ISO-only. They ship in the squashfs so the ISO
+    # can use them, but the animation and the MOTD are wired up by the ISO
+    # builder at boot time, into the live overlay only. An installed system
+    # carries no init= on its kernel cmdline, so neither would ever run there --
+    # exclude them rather than ship dead weight. The leading slash anchors each
+    # pattern to the transfer root, so these cannot match a deeper path.
     rsync -aHAX -P / "$MP" \
         --no-owner --no-group \
         --exclude=/dev \
@@ -170,7 +176,9 @@ copy_rootfs() {
         --exclude=/tmp \
         --exclude=/mnt \
         --exclude=/lost+found \
-        --exclude=/.snapshots
+        --exclude=/.snapshots \
+        --exclude=/intro \
+        --exclude=/motd
 }
 
 get_uuid() {
