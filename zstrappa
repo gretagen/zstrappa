@@ -11,7 +11,7 @@ Options:
   --uefi        Force UEFI bootloader installation
   --bios        Force BIOS/legacy bootloader installation
 
-Install Haliade system from the live ISO to a target block device.
+Install HaliadeSYS from the live ISO to a target block device.
 
 Arguments:
   root-device   Target root partition (e.g. /dev/sda2, /dev/nvme0n1p2)
