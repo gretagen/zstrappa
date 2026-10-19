@@ -1,5 +1,5 @@
 #!/bin/bash
-# zstrappa - Install Haliade OS to a target device
+# zstrappa - Install Haliade system to a target device
 
 set -e
 
@@ -11,7 +11,7 @@ Options:
   --uefi        Force UEFI bootloader installation
   --bios        Force BIOS/legacy bootloader installation
 
-Install Haliade OS from the live ISO to a target block device.
+Install Haliade system from the live ISO to a target block device.
 
 Arguments:
   root-device   Target root partition (e.g. /dev/sda2, /dev/nvme0n1p2)
@@ -159,14 +159,54 @@ mount_target() {
 
 
 
+# Live boot artifacts, as the running ISO's tmpfs overlay presents them in /.
+# haliade-iso-regen writes /usr/sbin/haliade-boot-intro at boot into the
+# overlay's RAM upper layer, and the initramfs touches /fastboot, so a live
+# system copying itself to a target would otherwise hand those over. /intro is
+# the artwork the live boot plays and nothing else uses.
+#
+# The animation wrapper is harmless on an installed system -- its kernel cmdline
+# carries no init=, so nothing would ever exec it -- but it is dead weight.
+#
+# Removed before copying rather than merely filtered, so the install source is
+# clean and a later rsync or manual copy cannot resurrect them. The leading
+# slash anchors each path to the root. Note the wrapper is /usr/sbin/... and not
+# /sbin/...: the rootfs has "sbin -> usr/sbin", so /sbin/haliade-boot-intro is
+# the same file reached through a symlink and a /sbin pattern would not match.
+LIVE_ONLY_PATHS="/intro
+/usr/sbin/haliade-boot-intro
+/fastboot"
+
+# Drop the live overlay's artifacts from the install source. rm-ing a file that
+# the overlay only has in its upper layer just deletes it; overlayfs whiteouts
+# the ones that also exist below, so in every case the path stops being visible
+# in / and the copy cannot pick it up. Running this on a system that has none of
+# these is a no-op.
+purge_live_only() {
+    echo "Removing the live boot's artifacts from the install source..."
+    local p removed=0
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            rm -f "$p" || {
+                echo "Error: could not remove $p" >&2
+                return 1
+            }
+            echo "  removed $p"
+            removed=$((removed + 1))
+        fi
+    done <<< "$LIVE_ONLY_PATHS"
+    [ "$removed" -gt 0 ] || echo "  nothing to remove (not a live system?)"
+}
+
 copy_rootfs() {
     echo "Copying root filesystem (this may take a while)..."
-    # /intro and /motd are live-ISO-only. They ship in the squashfs so the ISO
-    # can use them, but the animation and the MOTD are wired up by the ISO
-    # builder at boot time, into the live overlay only. An installed system
-    # carries no init= on its kernel cmdline, so neither would ever run there --
-    # exclude them rather than ship dead weight. The leading slash anchors each
-    # pattern to the transfer root, so these cannot match a deeper path.
+    local -a live_excludes=()
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] && live_excludes+=("--exclude=$p")
+    done <<< "$LIVE_ONLY_PATHS"
+
     rsync -aHAX -P / "$MP" \
         --no-owner --no-group \
         --exclude=/dev \
@@ -177,8 +217,27 @@ copy_rootfs() {
         --exclude=/mnt \
         --exclude=/lost+found \
         --exclude=/.snapshots \
-        --exclude=/intro \
-        --exclude=/motd
+        --exclude=/.tmp-anims \
+        "${live_excludes[@]}"
+}
+
+# Belt and braces for the two lists above. If haliade-iso-regen ever grows a new
+# live-only artifact and this list is not updated, catch it here rather than
+# discovering it as a mysteriously clearing login prompt on the installed
+# system. Runs before the bootloader is written, so a failure stops the install
+# while it is still recoverable.
+verify_no_live_only() {
+    local p found=()
+    while IFS= read -r p; do
+        [ -n "$p" ] && [ -e "$MP$p" ] && found+=("$p")
+    done <<< "$LIVE_ONLY_PATHS"
+    if [ ${#found[@]} -ne 0 ]; then
+        echo "Error: live-only paths reached the target:" >&2
+        printf '  %s\n' "${found[@]}" >&2
+        echo "Update LIVE_ONLY_PATHS to match haliade-iso-regen." >&2
+        return 1
+    fi
+    echo "Verified: no live boot artifacts on the target."
 }
 
 get_uuid() {
@@ -204,12 +263,12 @@ update_boot_config() {
 
     # Prefer kernels already copied onto the target boot partition
     kernel=$(ls "$MP/boot"/vmlinuz-* 2>/dev/null | head -1 | xargs -r basename)
-    [ -n "$kernel" ] || kernel="vmlinuz-6.16.1-defzrn"
-    if [ -f "$MP/boot/initramfs-installed.img" ]; then
-        initrd="initramfs-installed.img"
+    [ -n "$kernel" ] || kernel="vmlinuz-6.18.10-gen"
+    if [ -f "$MP/boot/initramfs-core.img" ]; then
+        initrd="initramfs-core.img"
     else
         initrd=$(ls "$MP/boot"/initramfs-*.img 2>/dev/null | head -1 | xargs -r basename)
-        [ -n "$initrd" ] || initrd="initramfs-installed.img"
+        [ -n "$initrd" ] || initrd="initramfs-core.img"
     fi
 
     extras=""
@@ -221,17 +280,17 @@ update_boot_config() {
     local limine_conf="$MP/boot/limine.conf"
     echo "Writing boot configuration (root=$root_spec rootflags=subvol=@)..."
     cat > "$limine_conf" <<EOF
-# Limine configuration for Haliade OS — managed by chronos
+# Limine configuration for Haliade system — managed by chronos
 # Do not hand-edit generation entries; run: chronos rewrite-limine
 
 timeout: 15
 serial: yes
 
-/Haliade OS
+/Haliade SYS
     protocol: linux
     kernel_path: boot():/${kernel}
     module_path: boot():/${initrd}
-    cmdline: root=${root_spec} rootflags=subvol=@ rw ${extras}
+    cmdline: root=${root_spec} rootflags=subvol=@ rw ${extras} init=/sbin/openrc-init
 EOF
 }
 
@@ -316,21 +375,33 @@ ensure_installed_initramfs() {
     echo "Reusing shipped initramfs (no regeneration)..."
 
     # The installed initramfs ships pre-built inside this live rootfs as
-    # boot/initramfs-installed.img and is copied to the target by copy_rootfs.
+    # boot/initramfs-core.img and is copied to the target by copy_rootfs.
     # We do NOT regenerate it here: mkinitcpio against the read-only live
     # squashfs (host-side init_functions / mkinitcpio-installed.conf) fails,
     # and regenerating per-install is unnecessary — the shipped image is the
     # one that was boot-tested.
-    if [ ! -s "$MP/boot/initramfs-installed.img" ]; then
-        echo "Error: boot/initramfs-installed.img not found after rootfs copy" >&2
+    if [ ! -s "$MP/boot/initramfs-core.img" ]; then
+        echo "Error: boot/initramfs-core.img not found after rootfs copy" >&2
         return 1
     fi
 
-    if ! verify_initramfs_run_mount "$MP/boot/initramfs-installed.img"; then
+    # A reinstall target can still carry the pre-rename image: copy_rootfs has
+    # no --delete, so initramfs-installed.img from an earlier install survives
+    # next to the fresh core.img, and chronos would then generate boot entries
+    # pointing at it. Drop it here so the target converges on initramfs-core.
+    if [ -e "$MP/boot/initramfs-installed.img" ] || [ -L "$MP/boot/initramfs-installed.img" ]; then
+        echo "  removing stale boot/initramfs-installed.img (pre-rename image)"
+        rm -f "$MP/boot/initramfs-installed.img" || {
+            echo "Error: could not remove stale boot/initramfs-installed.img" >&2
+            return 1
+        }
+    fi
+
+    if ! verify_initramfs_run_mount "$MP/boot/initramfs-core.img"; then
         echo "Error: shipped initramfs mounts /run with source 'run', not 'tmpfs'; refusing to install" >&2
         return 1
     fi
-    echo "  initramfs: $MP/boot/initramfs-installed.img ($(du -h "$MP/boot/initramfs-installed.img" | cut -f1))"
+    echo "  initramfs: $MP/boot/initramfs-core.img ($(du -h "$MP/boot/initramfs-core.img" | cut -f1))"
 
     # Keep the target's on-disk mkinitcpio init_functions patched so any later
     # manual regeneration outside zstrappa also produces a correct /run mount.
@@ -394,11 +465,11 @@ install_bootloader_uefi() {
     if [ -n "$disk" ] && [ -n "$part_num" ]; then
         if command -v efibootmgr &>/dev/null; then
             echo "Creating UEFI boot entry..."
-            efibootmgr -c -d "$disk" -p "$part_num" -L "Haliade OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
+            efibootmgr -c -d "$disk" -p "$part_num" -L "Haliade SYS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
                 echo "Warning: Failed to create UEFI boot entry" >&2
                 echo "Some firmware may not boot without a manual entry." >&2
                 echo "You can add one later with:" >&2
-                echo "  efibootmgr -c -d $disk -p $part_num -L 'Haliade OS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
+                echo "  efibootmgr -c -d $disk -p $part_num -L 'Haliade SYS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
             }
         else
             echo "Warning: efibootmgr not found. UEFI boot entry not created." >&2
@@ -484,7 +555,7 @@ create_initial_generation() {
             cat > "$MP/.snapshots/gen-1.meta.toml" <<EOF
 id = "gen-1"
 timestamp = $ts
-description = "initial install"
+description = "initial installation"
 EOF
             echo "gen-1" > "$MP/.snapshots/.current"
         fi
@@ -531,11 +602,11 @@ append_generation_limine_entry() {
     fi
     kernel=$(ls "$MP/boot"/vmlinuz-* 2>/dev/null | head -1 | xargs -r basename)
     [ -n "$kernel" ] || kernel="vmlinuz-6.16.1-defzrn"
-    if [ -f "$MP/boot/initramfs-installed.img" ]; then
-        initrd="initramfs-installed.img"
+    if [ -f "$MP/boot/initramfs-core.img" ]; then
+        initrd="initramfs-core.img"
     else
         initrd=$(ls "$MP/boot"/initramfs-*.img 2>/dev/null | head -1 | xargs -r basename)
-        [ -n "$initrd" ] || initrd="initramfs-installed.img"
+        [ -n "$initrd" ] || initrd="initramfs-core.img"
     fi
     extras=""
     cmdline=$(grep -m1 'cmdline:' "$limine_conf" | sed 's/.*cmdline:[[:space:]]*//')
@@ -549,7 +620,7 @@ append_generation_limine_entry() {
     cat >> "$limine_conf" <<EOF
 
 /Generations
-    //Haliade OS (Generation 1)
+    //Haliade SYS (Generation 1)
         protocol: linux
         kernel_path: boot():/${kernel}
         module_path: boot():/${initrd}
@@ -582,23 +653,25 @@ check_root
 validate_device "$ROOT_DEV" "root"
 [ -n "$BOOT_DEV" ] && validate_device "$BOOT_DEV" "boot"
 
-read -rp "Bootstrap Haliade OS? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
+read -rp "Bootstrap this Haliade system? this will wipe the whole drive, this action cannot be undone. [Y/n] : " choice
 
 case "$choice" in
     [Yy])
       echo "Now bootstrapping..."
       sleep 1
       trap cleanup EXIT
+      purge_live_only
       mount_target
       copy_rootfs
       create_dirs
       fix_permissions
       update_boot_config
+      verify_no_live_only
       verify_boot_files
       generate_fstab
       install_bootloader
       create_initial_generation
-      echo "Haliade OS has been successfully bootstrapped and installed on your machine, you can reboot now."
+      echo "The Haliade system has been successfully bootstrapped and installed on your machine, you can reboot now."
       ;;
     *)
       echo "Cancelled."
