@@ -286,7 +286,7 @@ update_boot_config() {
 timeout: 15
 serial: yes
 
-/Haliade SYS
+/HaliadeSYS
     protocol: linux
     kernel_path: boot():/${kernel}
     module_path: boot():/${initrd}
@@ -465,11 +465,11 @@ install_bootloader_uefi() {
     if [ -n "$disk" ] && [ -n "$part_num" ]; then
         if command -v efibootmgr &>/dev/null; then
             echo "Creating UEFI boot entry..."
-            efibootmgr -c -d "$disk" -p "$part_num" -L "Haliade SYS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
+            efibootmgr -c -d "$disk" -p "$part_num" -L "HaliadeSYS" -l '\EFI\BOOT\BOOTX64.EFI' 2>&1 || {
                 echo "Warning: Failed to create UEFI boot entry" >&2
                 echo "Some firmware may not boot without a manual entry." >&2
                 echo "You can add one later with:" >&2
-                echo "  efibootmgr -c -d $disk -p $part_num -L 'Haliade SYS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
+                echo "  efibootmgr -c -d $disk -p $part_num -L 'HaliadeSYS' -l '\\\\EFI\\\\BOOT\\\\BOOTX64.EFI'" >&2
             }
         else
             echo "Warning: efibootmgr not found. UEFI boot entry not created." >&2
@@ -620,7 +620,7 @@ append_generation_limine_entry() {
     cat >> "$limine_conf" <<EOF
 
 /Generations
-    //Haliade SYS (Generation 1)
+    //HaliadeSYS (Generation 1)
         protocol: linux
         kernel_path: boot():/${kernel}
         module_path: boot():/${initrd}
